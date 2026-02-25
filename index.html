@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Moonshine STT Demo</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #0f1117; color: #e0e0e0;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 2rem;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #fff; }
+  .status {
+    display: inline-block; padding: 0.25rem 0.75rem; border-radius: 999px;
+    font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+    margin-bottom: 1.5rem;
+  }
+  .status.disconnected { background: #3a1c1c; color: #f87171; }
+  .status.connected    { background: #1c3a1c; color: #4ade80; }
+  .status.recording    { background: #3a2e1c; color: #facc15; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{ opacity:1; } 50%{ opacity:0.5; } }
+
+  .mic-btn {
+    width: 72px; height: 72px; border-radius: 50%; border: none; cursor: pointer;
+    background: #2563eb; color: #fff; font-size: 1.8rem;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.2s, transform 0.1s;
+    margin-bottom: 1.5rem;
+  }
+  .mic-btn:hover { background: #1d4ed8; }
+  .mic-btn:active { transform: scale(0.95); }
+  .mic-btn.active { background: #dc2626; }
+
+  .transcript-box {
+    width: 100%; max-width: 640px; min-height: 300px;
+    background: #1a1d27; border: 1px solid #2a2d37; border-radius: 12px;
+    padding: 1rem; overflow-y: auto; font-size: 0.95rem; line-height: 1.6;
+  }
+  .transcript-box .partial { color: #888; }
+  .transcript-box .final   { color: #fff; }
+  .transcript-box .final + .final::before { content: " "; }
+</style>
+</head>
+<body>
+<h1>Moonshine STT</h1>
+<div class="status disconnected" id="status">Disconnected</div>
+<button class="mic-btn" id="micBtn" title="Toggle microphone">&#x1F3A4;</button>
+<div class="transcript-box" id="transcript"></div>
+
+<script>
+const CHUNK_SIZE = 2048;
+const SAMPLE_RATE = 16000;
+const WS_URL = `ws://${location.hostname || 'localhost'}:${location.port || 8766}/ws`;
+
+const statusEl    = document.getElementById('status');
+const micBtn      = document.getElementById('micBtn');
+const transcriptEl= document.getElementById('transcript');
+
+let ws = null;
+let audioCtx = null;
+let micStream = null;
+let workletNode = null;
+let scriptNode = null;
+let recording = false;
+
+function setStatus(s) {
+  statusEl.textContent = s.charAt(0).toUpperCase() + s.slice(1);
+  statusEl.className = 'status ' + s;
+}
+
+// ---- WebSocket ----
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => setStatus('connected');
+  ws.onclose = () => { setStatus('disconnected'); stop(); };
+  ws.onerror = () => { setStatus('disconnected'); };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    handleMessage(msg);
+  };
+}
+
+function handleMessage(msg) {
+  if (msg.type === 'partial') {
+    let el = transcriptEl.querySelector('.partial:last-child');
+    if (!el) { el = document.createElement('span'); el.className = 'partial'; transcriptEl.appendChild(el); }
+    el.textContent = msg.text;
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  } else if (msg.type === 'final') {
+    // Replace partial with final
+    const p = transcriptEl.querySelector('.partial:last-child');
+    if (p) p.remove();
+    const el = document.createElement('span');
+    el.className = 'final';
+    el.textContent = msg.text;
+    transcriptEl.appendChild(el);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+  // speech_start / speech_end are handled implicitly
+}
+
+// ---- Audio capture ----
+async function startAudio() {
+  audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true } });
+  const source = audioCtx.createMediaStreamSource(micStream);
+
+  // Try AudioWorklet first
+  try {
+    const blob = new Blob([`
+      class PCMProcessor extends AudioWorkletProcessor {
+        constructor() { super(); this._buf = new Float32Array(${CHUNK_SIZE}); this._pos = 0; }
+        process(inputs) {
+          const input = inputs[0][0];
+          if (!input) return true;
+          for (let i = 0; i < input.length; i++) {
+            this._buf[this._pos++] = input[i];
+            if (this._pos >= ${CHUNK_SIZE}) {
+              this.port.postMessage(this._buf.slice());
+              this._pos = 0;
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-processor', PCMProcessor);
+    `], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+    workletNode.port.onmessage = (e) => sendAudio(e.data);
+    source.connect(workletNode);
+    workletNode.connect(audioCtx.destination);
+  } catch (_) {
+    // ScriptProcessor fallback
+    const bufSize = 4096;
+    scriptNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
+    const remainder = new Float32Array(CHUNK_SIZE);
+    let rPos = 0;
+    scriptNode.onaudioprocess = (e) => {
+      const data = e.inputBuffer.getChannelData(0);
+      for (let i = 0; i < data.length; i++) {
+        remainder[rPos++] = data[i];
+        if (rPos >= CHUNK_SIZE) {
+          sendAudio(remainder.slice());
+          rPos = 0;
+        }
+      }
+    };
+    source.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination);
+  }
+}
+
+function sendAudio(f32arr) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(f32arr.buffer);
+  }
+}
+
+async function start() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) connectWS();
+  await startAudio();
+  recording = true;
+  micBtn.classList.add('active');
+  setStatus('recording');
+}
+
+function stop() {
+  recording = false;
+  micBtn.classList.remove('active');
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (workletNode) { workletNode.disconnect(); workletNode = null; }
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (ws && ws.readyState === WebSocket.OPEN) setStatus('connected');
+}
+
+micBtn.addEventListener('click', () => {
+  if (recording) stop(); else start();
+});
+
+// Auto-connect
+connectWS();
+</script>
+</body>
+</html>
